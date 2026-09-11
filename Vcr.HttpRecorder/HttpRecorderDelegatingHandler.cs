@@ -24,6 +24,7 @@ namespace Vcr.HttpRecorder
         private readonly IRequestMatcher _matcher;
         private readonly IInteractionRepository _repository;
         private readonly IInteractionAnonymizer _anonymizer;
+        private readonly bool _requiresRecordingSnapshot;
         private readonly SemaphoreSlim _interactionLock = new SemaphoreSlim(1, 1);
         private readonly bool _disposed = false;
         private HttpRecorderMode? _executionMode;
@@ -63,6 +64,7 @@ namespace Vcr.HttpRecorder
             _matcher = matcher ?? RulesMatcher.MatchOnce.ByHttpMethod().ByRequestUri();
             _repository = repository ?? new HttpArchiveInteractionRepository();
             _anonymizer = anonymizer ?? RulesInteractionAnonymizer.Default;
+            _requiresRecordingSnapshot = !ReferenceEquals(_anonymizer, RulesInteractionAnonymizer.Default);
         }
 
         /// <summary>
@@ -133,8 +135,11 @@ namespace Vcr.HttpRecorder
                 var innerResponse = await base.SendAsync(request, cancellationToken);
                 sw.Stop();
 
+                var recordingResponse = _requiresRecordingSnapshot
+                    ? await CreateRecordingResponseSnapshot(innerResponse, request)
+                    : innerResponse;
                 var newInteractionMessage = new InteractionMessage(
-                    innerResponse,
+                    recordingResponse,
                     new InteractionMessageTimings(start, sw.Elapsed));
 
                 _interaction = new Interaction(
@@ -146,7 +151,7 @@ namespace Vcr.HttpRecorder
                 _interaction = await _anonymizer.Anonymize(_interaction, cancellationToken);
                 _interaction = await _repository.StoreAsync(_interaction, cancellationToken);
 
-                return await PostProcessResponse(newInteractionMessage.Response);
+                return await PostProcessResponse(innerResponse);
             }
             finally
             {
@@ -205,6 +210,118 @@ namespace Vcr.HttpRecorder
             }
 
             return response;
+        }
+
+        /// <summary>
+        /// Creates an independent response snapshot for anonymization and storage.
+        /// </summary>
+        /// <param name="response">The live response.</param>
+        /// <param name="fallbackRequest">The request to use when the response does not reference one.</param>
+        /// <returns>A response snapshot whose mutable messages, content, and headers are not shared with the live response.</returns>
+        private static async Task<HttpResponseMessage> CreateRecordingResponseSnapshot(
+            HttpResponseMessage response,
+            HttpRequestMessage fallbackRequest)
+        {
+            HttpRequestMessage requestSnapshot = null;
+            HttpResponseMessage responseSnapshot = null;
+            try
+            {
+                requestSnapshot = await CloneRequest(response.RequestMessage ?? fallbackRequest);
+                responseSnapshot = new HttpResponseMessage(response.StatusCode);
+                responseSnapshot.Content = await CloneContent(response.Content);
+                responseSnapshot.ReasonPhrase = response.ReasonPhrase;
+                responseSnapshot.RequestMessage = requestSnapshot;
+                responseSnapshot.Version = response.Version;
+
+                foreach (var header in response.Headers)
+                {
+                    responseSnapshot.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                }
+
+                return responseSnapshot;
+            }
+            catch
+            {
+                responseSnapshot?.Dispose();
+                requestSnapshot?.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Creates an independent request snapshot for anonymization and storage.
+        /// </summary>
+        /// <param name="request">The request to clone.</param>
+        /// <returns>A cloned request, or null when <paramref name="request"/> is null.</returns>
+        private static async Task<HttpRequestMessage> CloneRequest(HttpRequestMessage request)
+        {
+            if (request == null)
+            {
+                return null;
+            }
+
+            var requestSnapshot = new HttpRequestMessage();
+            try
+            {
+                requestSnapshot.Method = request.Method;
+                requestSnapshot.RequestUri = request.RequestUri;
+                requestSnapshot.Version = request.Version;
+                requestSnapshot.Content = await CloneContent(request.Content);
+                foreach (var header in request.Headers)
+                {
+                    requestSnapshot.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                }
+
+                return requestSnapshot;
+            }
+            catch
+            {
+                requestSnapshot.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Creates independently owned content while preserving its headers.
+        /// </summary>
+        /// <param name="content">The content to clone.</param>
+        /// <returns>Cloned content, or null when <paramref name="content"/> is null.</returns>
+        private static async Task<HttpContent> CloneContent(HttpContent content)
+        {
+            if (content == null)
+            {
+                return null;
+            }
+
+            var hasContentLength = content.Headers.Contains("Content-Length");
+            var headers = content.Headers
+                .Select(header => new
+                {
+                    header.Key,
+                    Values = header.Value.ToArray(),
+                })
+                .ToArray();
+            var contentSnapshot = new ByteArrayContent(
+                (byte[])(await content.ReadAsByteArrayAsync()).Clone());
+            try
+            {
+                foreach (var header in headers)
+                {
+                    contentSnapshot.Headers.TryAddWithoutValidation(header.Key, header.Values);
+                }
+
+                if (!hasContentLength)
+                {
+                    contentSnapshot.Headers.ContentLength = null;
+                }
+
+                return contentSnapshot;
+            }
+            catch
+            {
+                contentSnapshot.Dispose();
+                throw;
+            }
         }
 
         /// <summary>
