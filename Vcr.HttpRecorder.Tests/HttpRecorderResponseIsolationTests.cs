@@ -188,6 +188,7 @@ namespace Vcr.HttpRecorder.Tests
             (await recordedResponse.Content.ReadAsByteArrayAsync()).Should().Equal(responseBytes);
             recordedResponse.Content.Headers.ContentType.MediaType.Should().Be("application/octet-stream");
             recordedResponse.Content.Headers.Contains("Content-Length").Should().BeFalse();
+            liveResponse.Content.Headers.Contains("Content-Length").Should().BeFalse();
             recordedResponse.RequestMessage.Method.Should().Be(HttpMethod.Get);
             recordedResponse.RequestMessage.RequestUri.Should().Be(new Uri("https://example.test/fallback"));
             recordedResponse.RequestMessage.Version.Should().Be(HttpVersion.Version11);
@@ -282,6 +283,7 @@ namespace Vcr.HttpRecorder.Tests
             var recordedResponse = repository.StoredInteraction.Messages[0].Response;
 
             recordedResponse.Content.Headers.ContentLength.Should().Be(responseBytes.Length);
+            liveResponse.Content.Headers.ContentLength.Should().Be(responseBytes.Length);
             recordedResponse.RequestMessage.Content.Headers.ContentLength.Should().Be(requestBytes.Length);
             (await recordedResponse.RequestMessage.Content.ReadAsByteArrayAsync()).Should().Equal(requestBytes);
         }
