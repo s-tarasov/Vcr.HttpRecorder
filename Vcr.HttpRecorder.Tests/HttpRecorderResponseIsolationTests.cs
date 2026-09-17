@@ -312,29 +312,83 @@ namespace Vcr.HttpRecorder.Tests
         }
 
         [Theory]
-        [InlineData(false)]
-        [InlineData(true)]
-        public async Task ItShouldNotCloneWhenUsingDefaultAnonymizer(bool passDefaultExplicitly)
+        [InlineData(0)]
+        [InlineData(1)]
+        [InlineData(2)]
+        public async Task ItShouldAlwaysIsolateRecordedMessages(int anonymizerKind)
         {
+            const string RequestBody = "original request";
+            const string ResponseBody = "original response";
             var repository = new CapturingRepository();
-            var anonymizer = passDefaultExplicitly ? RulesInteractionAnonymizer.Default : null;
+            InteractionMessageTimings observedTimings = null;
+            IInteractionAnonymizer anonymizer = anonymizerKind switch
+            {
+                0 => null,
+                1 => RulesInteractionAnonymizer.Default,
+                _ => RulesInteractionAnonymizer.Default.WithRule(message => observedTimings = message.Timings),
+            };
             using var client = CreateClient(
                 "unused",
                 HttpRecorderMode.Record,
                 anonymizer,
-                new StaticResponseHandler(() => new HttpResponseMessage(HttpStatusCode.OK)
+                new StaticResponseHandler(() =>
                 {
-                    Content = new StringContent("body"),
+                    var response = new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(ResponseBody),
+                    };
+                    response.Headers.TryAddWithoutValidation("X-Response", "original");
+                    return response;
                 }),
                 repository);
-            using var request = new HttpRequestMessage(HttpMethod.Get, "default");
+            using var request = new HttpRequestMessage(HttpMethod.Post, "default")
+            {
+                Content = new StringContent(RequestBody),
+            };
+            request.Headers.TryAddWithoutValidation("X-Request", "original");
+            var beforeSend = DateTimeOffset.Now;
 
             using var liveResponse = await client.SendAsync(request);
-            var recordedResponse = repository.StoredInteraction.Messages[0].Response;
+            var afterSend = DateTimeOffset.Now;
+            var recordedMessage = repository.StoredInteraction.Messages[0];
+            var recordedResponse = recordedMessage.Response;
+            var recordedRequest = recordedResponse.RequestMessage;
 
-            recordedResponse.Should().BeSameAs(liveResponse);
-            recordedResponse.RequestMessage.Should().BeSameAs(request);
-            recordedResponse.Content.Should().BeSameAs(liveResponse.Content);
+            recordedMessage.Timings.Should().NotBeNull();
+            recordedMessage.Timings.StartedDateTime.Should().BeOnOrAfter(beforeSend);
+            recordedMessage.Timings.StartedDateTime.Should().BeOnOrBefore(afterSend);
+            recordedMessage.Timings.Time.Should().BeGreaterThanOrEqualTo(TimeSpan.Zero);
+            if (anonymizerKind == 2)
+            {
+                recordedMessage.Timings.Should().BeSameAs(observedTimings);
+            }
+
+            recordedResponse.Should().NotBeSameAs(liveResponse);
+            recordedRequest.Should().NotBeSameAs(request);
+            recordedResponse.Content.Should().NotBeSameAs(liveResponse.Content);
+            recordedRequest.Content.Should().NotBeSameAs(request.Content);
+            recordedRequest.Method.Should().Be(request.Method);
+            recordedRequest.RequestUri.Should().Be(request.RequestUri);
+            recordedRequest.Headers.GetValues("X-Request").Should().ContainSingle().Which.Should().Be("original");
+            recordedResponse.Headers.GetValues("X-Response").Should().ContainSingle().Which.Should().Be("original");
+            var recordedRequestBytes = await recordedRequest.Content.ReadAsByteArrayAsync();
+            var liveRequestBytes = await request.Content.ReadAsByteArrayAsync();
+            recordedRequestBytes.Should().Equal(liveRequestBytes);
+            recordedRequestBytes.Should().NotBeSameAs(liveRequestBytes);
+            var recordedResponseBytes = await recordedResponse.Content.ReadAsByteArrayAsync();
+            var liveResponseBytes = await liveResponse.Content.ReadAsByteArrayAsync();
+            recordedResponseBytes.Should().Equal(liveResponseBytes);
+            recordedResponseBytes.Should().NotBeSameAs(liveResponseBytes);
+
+            recordedRequest.Headers.Remove("X-Request");
+            recordedResponse.Headers.Remove("X-Response");
+            recordedRequest.Content.Dispose();
+            recordedResponse.Dispose();
+
+            request.Headers.GetValues("X-Request").Should().ContainSingle().Which.Should().Be("original");
+            liveResponse.Headers.GetValues("X-Response").Should().ContainSingle().Which.Should().Be("original");
+            (await request.Content.ReadAsStringAsync()).Should().Be(RequestBody);
+            (await liveResponse.Content.ReadAsStringAsync()).Should().Be(ResponseBody);
         }
 
         private static IInteractionAnonymizer CreateNoOpAnonymizer()

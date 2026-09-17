@@ -24,7 +24,6 @@ namespace Vcr.HttpRecorder
         private readonly IRequestMatcher _matcher;
         private readonly IInteractionRepository _repository;
         private readonly IInteractionAnonymizer _anonymizer;
-        private readonly bool _requiresRecordingSnapshot;
         private readonly SemaphoreSlim _interactionLock = new SemaphoreSlim(1, 1);
         private readonly bool _disposed = false;
         private HttpRecorderMode? _executionMode;
@@ -64,7 +63,6 @@ namespace Vcr.HttpRecorder
             _matcher = matcher ?? RulesMatcher.MatchOnce.ByHttpMethod().ByRequestUri();
             _repository = repository ?? new HttpArchiveInteractionRepository();
             _anonymizer = anonymizer ?? RulesInteractionAnonymizer.Default;
-            _requiresRecordingSnapshot = !ReferenceEquals(_anonymizer, RulesInteractionAnonymizer.Default);
         }
 
         /// <summary>
@@ -135,18 +133,16 @@ namespace Vcr.HttpRecorder
                 var innerResponse = await base.SendAsync(request, cancellationToken);
                 sw.Stop();
 
-                var recordingResponse = _requiresRecordingSnapshot
-                    ? await CreateRecordingResponseSnapshot(innerResponse, request)
-                    : innerResponse;
-                var newInteractionMessage = new InteractionMessage(
-                    recordingResponse,
+                var liveInteractionMessage = new InteractionMessage(
+                    innerResponse,
                     new InteractionMessageTimings(start, sw.Elapsed));
+                var recordingMessage = await CloneInteractionMessage(liveInteractionMessage, request);
 
                 _interaction = new Interaction(
                     InteractionName,
                     _interaction == null
-                        ? new[] { newInteractionMessage }
-                        : _interaction.Messages.Append(newInteractionMessage));
+                        ? new[] { recordingMessage }
+                        : _interaction.Messages.Append(recordingMessage));
 
                 _interaction = await _anonymizer.Anonymize(_interaction, cancellationToken);
                 _interaction = await _repository.StoreAsync(_interaction, cancellationToken);
@@ -205,19 +201,20 @@ namespace Vcr.HttpRecorder
         }
 
         /// <summary>
-        /// Creates an independent response snapshot for anonymization and storage.
+        /// Creates an independent interaction message for anonymization and storage.
         /// </summary>
-        /// <param name="response">The live response.</param>
+        /// <param name="message">The live interaction message.</param>
         /// <param name="fallbackRequest">The request to use when the response does not reference one.</param>
-        /// <returns>A response snapshot whose mutable messages, content, and headers are not shared with the live response.</returns>
-        private static async Task<HttpResponseMessage> CreateRecordingResponseSnapshot(
-            HttpResponseMessage response,
+        /// <returns>An interaction message whose mutable messages, content, and headers are not shared with the live response.</returns>
+        private static async Task<InteractionMessage> CloneInteractionMessage(
+            InteractionMessage message,
             HttpRequestMessage fallbackRequest)
         {
             HttpRequestMessage requestSnapshot = null;
             HttpResponseMessage responseSnapshot = null;
             try
             {
+                var response = message.Response;
                 requestSnapshot = await CloneRequest(response.RequestMessage ?? fallbackRequest);
                 responseSnapshot = new HttpResponseMessage(response.StatusCode);
                 responseSnapshot.Content = await CloneContent(response.Content);
@@ -230,7 +227,7 @@ namespace Vcr.HttpRecorder
                     responseSnapshot.Headers.TryAddWithoutValidation(header.Key, header.Value);
                 }
 
-                return responseSnapshot;
+                return new InteractionMessage(responseSnapshot, message.Timings);
             }
             catch
             {
